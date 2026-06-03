@@ -131,6 +131,8 @@ PY
     else
         HAZEL_TARGET="$HAZEL_USER@$HAZEL_HOST"
     fi
+
+    _build_excludes
 }
 
 
@@ -138,13 +140,14 @@ PY
 # INTERNAL HELPERS
 # =============================================================================
 
-# Build --exclude flags from the array above
+# Populate the global RSYNC_EXCLUDE_FLAGS array from RSYNC_EXCLUDES so it can be
+# expanded safely (quoted) on the rsync command line. Call after config load.
 _build_excludes() {
-    local flags=()
+    RSYNC_EXCLUDE_FLAGS=()
+    local pattern
     for pattern in "${RSYNC_EXCLUDES[@]}"; do
-        flags+=(--exclude="$pattern")
+        RSYNC_EXCLUDE_FLAGS+=(--exclude="$pattern")
     done
-    echo "${flags[@]}"
 }
 
 # Parse a sub-command's options. Recognises --delete and --force.
@@ -259,7 +262,9 @@ _validate_paths() {
     fi
 
     # HAZEL_BASE must be absolute (/...) or home-relative (~/...). The remote
-    # shell expands a leading ~, so both are valid rsync remote targets.
+    # shell expands a leading ~, so both are valid rsync remote targets. The
+    # tilde here is meant literally (it is a REMOTE path), so SC2088 is N/A.
+    # shellcheck disable=SC2088
     if [[ "$HAZEL_BASE" != /* && "$HAZEL_BASE" != "~/"* && "$HAZEL_BASE" != "~" ]]; then
         echo "hazsync: [hazel].base must be an absolute (/...) or home-relative (~/...) path, got: $HAZEL_BASE" >&2
         return 1
@@ -358,8 +363,7 @@ cmd_push() {
     _parse_flags "$@" || return 1
 
     local root
-    root=$(_find_project_root)
-    if [[ $? -ne 0 ]]; then
+    if ! root=$(_find_project_root); then
         echo "Error: not inside a project (no .projectroot found)"
         echo "       run: touch <project_root>/.projectroot"
         return 1
@@ -402,15 +406,14 @@ cmd_push() {
     if [[ -n "$DELETE_FLAG" ]]; then
         _confirm_delete "remote ($dst)" || return 1
     fi
-    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" "${RSYNC_EXCLUDE_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_pull() {
     _parse_flags "$@" || return 1
 
     local root
-    root=$(_find_project_root)
-    if [[ $? -ne 0 ]]; then
+    if ! root=$(_find_project_root); then
         echo "Error: not inside a project (no .projectroot found)"
         echo "       run: touch <project_root>/.projectroot"
         return 1
@@ -452,15 +455,14 @@ cmd_pull() {
     if [[ -n "$DELETE_FLAG" ]]; then
         _confirm_delete "local ($dst)" || return 1
     fi
-    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" "${RSYNC_EXCLUDE_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_dry_push() {
     _parse_flags "$@" || return 1
 
     local root
-    root=$(_find_project_root)
-    if [[ $? -ne 0 ]]; then
+    if ! root=$(_find_project_root); then
         echo "Error: not inside a project (no .projectroot found)"
         echo "       run: touch <project_root>/.projectroot"
         return 1
@@ -494,15 +496,14 @@ cmd_dry_push() {
     local hazignore_flag=()
     [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
     _ensure_session || return 1
-    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" "${RSYNC_EXCLUDE_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_dry_pull() {
     _parse_flags "$@" || return 1
 
     local root
-    root=$(_find_project_root)
-    if [[ $? -ne 0 ]]; then
+    if ! root=$(_find_project_root); then
         echo "Error: not inside a project (no .projectroot found)"
         echo "       run: touch <project_root>/.projectroot"
         return 1
@@ -535,13 +536,12 @@ cmd_dry_pull() {
     local hazignore_flag=()
     [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
     _ensure_session || return 1
-    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" "${RSYNC_EXCLUDE_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_status() {
     local root
-    root=$(_find_project_root)
-    if [[ $? -ne 0 ]]; then
+    if ! root=$(_find_project_root); then
         echo "hazsync status: not inside a project (no .projectroot found)"
         return 1
     fi
