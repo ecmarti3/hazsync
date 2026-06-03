@@ -36,13 +36,13 @@ host you can reach over SSH (Linux, macOS, or Windows running Cygwin/MSYS rsync)
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/hazsync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ecmarti3/hazsync/main/install.sh | bash
 ```
 
 Or clone and run the installer:
 
 ```bash
-git clone https://github.com/USER/hazsync.git
+git clone https://github.com/ecmarti3/hazsync.git
 cd hazsync
 ./install.sh          # installs to ~/.local/bin/hazsync
 ```

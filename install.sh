@@ -3,7 +3,7 @@
 # hazsync installer — macOS, Linux, and Windows (via WSL)
 # =============================================================================
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/USER/hazsync/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ecmarti3/hazsync/main/install.sh | bash
 #
 # Or, from a cloned checkout:
 #   ./install.sh
@@ -13,7 +13,7 @@
 # =============================================================================
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/USER/hazsync/main"
+REPO_RAW="https://raw.githubusercontent.com/ecmarti3/hazsync/main"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 DEST="$PREFIX/hazsync"
 

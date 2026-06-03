@@ -27,7 +27,7 @@ sudo apt install -y rsync openssh-client python3
 ## 3. Install hazsync inside WSL
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/hazsync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ecmarti3/hazsync/main/install.sh | bash
 ```
 
 If `~/.local/bin` isn't on your PATH, add it:

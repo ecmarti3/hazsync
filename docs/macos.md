@@ -18,7 +18,7 @@ brew install rsync
 ## 2. Install hazsync
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/hazsync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ecmarti3/hazsync/main/install.sh | bash
 ```
 
 If `~/.local/bin` isn't on your PATH, add it to `~/.zshrc`:
