@@ -17,7 +17,7 @@ Host hazel
     User your_unity_id
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
-    ControlPersist 4h
+    ControlPersist 15m
 ```
 
 - **`Host hazel`** — a short alias you can use anywhere (`ssh hazel`,
@@ -54,7 +54,7 @@ hazsync session end       # close the master
 ```
 
 `push`/`pull`/`dry-*` check for a live master first; if none exists they offer to
-start one. hazsync only *uses* the multiplexing you configure in `~/.ssh/config`
+start one. hazsync only _uses_ the multiplexing you configure in `~/.ssh/config`
 — it does not create its own socket settings.
 
 ## 3. Point hazsync at the alias
@@ -93,23 +93,6 @@ it you need:
    above is worth it: you clear Duo once, then work uninterrupted.
 
 4. **The login node hostname:** `login.hpc.ncsu.edu`.
-
-### Recommended Hazel `~/.ssh/config`
-
-```
-Host hazel
-    HostName login.hpc.ncsu.edu
-    User your_unity_id
-    ControlMaster auto
-    ControlPath ~/.ssh/cm-%r@%h:%p
-    ControlPersist 8h
-    ServerAliveInterval 60
-    ServerAliveCountInterval 3
-```
-
-- `ServerAliveInterval` / `...CountInterval` send keepalives so long-idle
-  sessions over VPN don't get silently dropped mid-transfer.
-- A longer `ControlPersist` (e.g. `8h`) covers a full work day on one Duo auth.
 
 ### First-time flow
 

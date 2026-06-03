@@ -12,6 +12,18 @@ The system `rsync` on older macOS releases is ancient. Install a modern one with
 brew install rsync
 ```
 
+Verify that the brew installed is the one on the correct path:
+
+```bash
+which rsync
+```
+
+It should return something to the effect of
+
+```bash
+/usr/local/bin/rsync
+```
+
 `python3` is also available via `brew install python` if you don't already have a
 3.11+ interpreter (needed for TOML config parsing; otherwise `pip install tomli`).
 
@@ -39,7 +51,7 @@ Host myremote
     User your_user
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
-    ControlPersist 4h
+    ControlPersist 15m
 ```
 
 Then set `target = "myremote"` in your `hazsync.toml`.

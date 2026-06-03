@@ -17,8 +17,8 @@ host you can reach over SSH (Linux, macOS, or Windows running Cygwin/MSYS rsync)
   refuses to run unattended without `--force`; paths are validated before any
   rsync touches the remote.
 - **Dry-run previews** — `dry-push` / `dry-pull` show exactly what would move.
-- **Targeted sync** — `hazsync pull PATH` grabs a single file or folder *even if
-  it is normally excluded* — handy for fetching one big ignored output file.
+- **Targeted sync** — `hazsync pull PATH` grabs a single file or folder _even if
+  it is normally excluded_ — handy for fetching one big ignored output file.
 - **SSH multiplexing** — reuses a persistent SSH master so you authenticate once
   per work session.
 
@@ -47,6 +47,14 @@ cd hazsync
 ./install.sh          # installs to ~/.local/bin/hazsync
 ```
 
+If on windows first install WSL:
+
+```bash
+wsl --install
+```
+
+After wsl has finished installing restart computer before proceeding to next steps
+
 ## Quickstart
 
 ```bash
@@ -63,16 +71,16 @@ hazsync pull                        # download remote -> local
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `init` | Create a `.projectroot` marker in the current directory. |
-| `push [--delete] [--force] [PATH...]` | Sync local project → remote. |
-| `pull [--delete] [--force] [PATH...]` | Sync remote project → local. |
-| `dry-push` / `dry-pull` `[--delete] [PATH...]` | Preview a push/pull; transfers nothing. |
-| `status` | Show project name and sync targets (no network call). |
-| `session <start\|status\|end\|new>` | Manage the multiplexed SSH session. |
-| `config-init` | Write a default config if none exists. |
-| `version` / `help` | Show version / usage. |
+| Command                                        | Description                                              |
+| ---------------------------------------------- | -------------------------------------------------------- |
+| `init`                                         | Create a `.projectroot` marker in the current directory. |
+| `push [--delete] [--force] [PATH...]`          | Sync local project → remote.                             |
+| `pull [--delete] [--force] [PATH...]`          | Sync remote project → local.                             |
+| `dry-push` / `dry-pull` `[--delete] [PATH...]` | Preview a push/pull; transfers nothing.                  |
+| `status`                                       | Show project name and sync targets (no network call).    |
+| `session <start\|status\|end\|new>`            | Manage the multiplexed SSH session.                      |
+| `config-init`                                  | Write a default config if none exists.                   |
+| `version` / `help`                             | Show version / usage.                                    |
 
 ### Targeted sync (bypasses excludes)
 
@@ -99,11 +107,11 @@ hazsync push --delete
 
 `[hazel].base` must be a path the **remote** understands:
 
-| Remote OS | Example `base` |
-|---|---|
-| Linux | `/home/you/projects` |
-| macOS | `/Users/you/projects` |
-| Windows (Cygwin/MSYS rsync) | `/cygdrive/c/Users/you/projects` |
+| Remote OS                   | Example `base`                   |
+| --------------------------- | -------------------------------- | --------------- |
+| Linux                       | `/home/you/projects`             |
+| macOS                       | `/Users/you/projects`            |
+| Windows (Cygwin/MSYS rsync) | `/cygdrive/c/Users/you/projects` | \* Not prefered |
 
 > **Windows gotcha:** do not use `C:\...` and do not rely on a bare `~` — Cygwin
 > rsync will not expand `~` and creates a literal `~` folder. Always spell out
