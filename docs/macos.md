@@ -43,3 +43,6 @@ Host myremote
 ```
 
 Then set `target = "myremote"` in your `hazsync.toml`.
+
+For a full explanation of multiplexing and connecting to NCSU Hazel (VPN, Duo,
+`ControlPersist`, etc.), see [ssh.md](ssh.md).

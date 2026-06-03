@@ -29,6 +29,9 @@ host you can reach over SSH (Linux, macOS, or Windows running Cygwin/MSYS rsync)
   See [docs/windows.md](docs/windows.md). (Native Windows has no built-in rsync.)
 - **macOS users:** see [docs/macos.md](docs/macos.md) (usually just
   `brew install rsync`).
+- **SSH setup, multiplexing, and NCSU Hazel:** see [docs/ssh.md](docs/ssh.md) —
+  recommended reading; it's how you avoid re-authenticating (and re-doing Duo)
+  on every command.
 
 ## Install
 
