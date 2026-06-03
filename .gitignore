@@ -1,0 +1,6 @@
+# local config / test artifacts
+*.toml
+!examples/*.toml
+.DS_Store
+.projectroot
+.hazignore

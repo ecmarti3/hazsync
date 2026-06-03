@@ -1,0 +1,46 @@
+# hazsync configuration — example
+#
+# Copy this to one of the locations hazsync searches (first hit wins):
+#   1. $HAZSYNC_CONFIG
+#   2. ${XDG_CONFIG_HOME:-$HOME/.config}/hazsync/hazsync.toml
+#   3. ~/.hazsync.toml
+#
+# Or just run `hazsync config-init` to scaffold one, then edit it.
+
+[hazel]
+# SSH user and host for the remote you sync to.
+user = "your_user"
+host = "remote.example.com"
+
+# Base directory ON THE REMOTE where your projects live. Each project is
+# synced to <base>/<project-folder-name>/.
+#
+# Use a path the REMOTE understands:
+#   Linux remote   : /home/your_user/projects
+#   macOS remote   : /Users/your_user/projects
+#   Windows remote : use the Cygwin/MSYS POSIX form, NOT C:\...
+#                    e.g.  /cygdrive/c/Users/your_user/projects
+#                    (a bare ~ is NOT reliably expanded on Cygwin — spell it out)
+base = "/home/your_user/projects"
+
+# Optional: an SSH alias from your ~/.ssh/config. If set, hazsync uses this
+# verbatim as the rsync target instead of building "<user>@<host>". Handy when
+# you have a "Host myremote" stanza with ControlMaster settings.
+# target = "myremote"
+
+[local]
+# Base directory on THIS machine where your projects live (~ is expanded).
+base = "~/projects"
+
+[sync]
+# Patterns excluded from full push/pull (passed straight to rsync --exclude).
+# A targeted sync (`hazsync pull PATH`) bypasses these on purpose.
+excludes = [
+    ".DS_Store",
+    ".projectroot",
+    "*.o",
+    "*.mod",
+    "*.exe",
+    "*.out",
+    "__pycache__",
+]

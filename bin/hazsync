@@ -1,0 +1,752 @@
+#!/usr/bin/env bash
+# =============================================================================
+# hazsync — rsync CLI for Hazel HPC cluster
+HAZSYNC_VERSION="1.0.0"
+# =============================================================================
+# SETUP:
+#   1. Place this file on your PATH:
+#        cp hazsync /usr/local/bin/hazsync
+#        chmod +x /usr/local/bin/hazsync
+#   2. Scaffold a config file and edit it to your taste:
+#        hazsync config-init
+#      This writes ~/.config/hazsync/hazsync.toml if none exists.
+#   3. Mark each project root (from inside the project directory):
+#        hazsync init
+#
+# CONFIG:
+#   hazsync reads its settings from a TOML file, looked up in this order:
+#     1. $HAZSYNC_CONFIG                              (if set and file exists)
+#     2. $XDG_CONFIG_HOME/hazsync/hazsync.toml        (default: ~/.config/...)
+#     3. ~/.hazsync.toml
+#   Run `hazsync config-init` to scaffold a default template.
+#
+# USAGE (from anywhere inside a project directory):
+#   hazsync init                       — create a .projectroot marker in the current directory
+#   hazsync push [--delete] [--force] [PATH...]  — sync local project → Hazel
+#   hazsync pull [--delete] [--force] [PATH...]  — sync Hazel project → local
+#   hazsync dry  [--delete]            — preview what push would transfer (connects to Hazel)
+#
+#   PATH...  one or more project-relative paths (files or folders). When given,
+#            ONLY those paths are synced and the exclude rules are bypassed —
+#            use this to grab something that is normally ignored, e.g.:
+#              hazsync pull results/run42.nc
+#              hazsync push data/raw/
+#   hazsync status                     — show project name and sync targets (no network call)
+#   hazsync session <start|status|end|new>  — manage the multiplexed SSH session to Hazel
+#   hazsync config-init                — write a default hazsync.toml if none exists
+#
+#   --delete  also mirrors deletions to the destination. Destructive; preview
+#             first with:  hazsync dry --delete
+#   --force   skip the interactive [y/N] confirmation that --delete triggers
+#             (also required when stdin is not a terminal — scripts, pipes).
+#
+# SSH MULTIPLEXING:
+#   push/pull/dry check `ssh -O check` first. If a multiplexed master is up,
+#   they run silently; if not, they prompt to start one so you only auth once
+#   per work session. Configure ControlMaster/ControlPath/ControlPersist in
+#   ~/.ssh/config for the Hazel host — hazsync leverages it but does not
+#   create its own socket.
+# =============================================================================
+
+
+# =============================================================================
+# CONFIG LOADING — settings come from a hazsync.toml file (see top header).
+# =============================================================================
+
+# Resolve the first existing config path. Echoes the path; returns 1 if none.
+_config_path() {
+    if [[ -n "${HAZSYNC_CONFIG:-}" && -f "$HAZSYNC_CONFIG" ]]; then
+        echo "$HAZSYNC_CONFIG"; return 0
+    fi
+    local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/hazsync/hazsync.toml"
+    if [[ -f "$xdg" ]]; then echo "$xdg"; return 0; fi
+    if [[ -f "$HOME/.hazsync.toml" ]]; then echo "$HOME/.hazsync.toml"; return 0; fi
+    return 1
+}
+
+# Parse the active hazsync.toml and populate the globals previously hardcoded:
+#   HAZEL_USER, HAZEL_HOST, HAZEL_BASE, HAZEL_TARGET, LOCAL_BASE, RSYNC_EXCLUDES.
+# Errors from Python (missing keys, bad TOML, no tomllib/tomli) go straight to
+# the user's stderr; this function returns the same non-zero exit code.
+_load_config() {
+    local cfg
+    if ! cfg=$(_config_path); then
+        echo "hazsync: no config file found. Searched:" >&2
+        echo "       \$HAZSYNC_CONFIG          (currently: ${HAZSYNC_CONFIG:-<unset>})" >&2
+        echo "       ${XDG_CONFIG_HOME:-$HOME/.config}/hazsync/hazsync.toml" >&2
+        echo "       $HOME/.hazsync.toml" >&2
+        echo "       Run 'hazsync config-init' to scaffold a default." >&2
+        return 1
+    fi
+
+    local parsed rc
+    parsed=$(python3 - "$cfg" <<'PY'
+import os, sys, shlex
+try:
+    import tomllib                          # Python 3.11+ stdlib
+except ImportError:
+    try:
+        import tomli as tomllib             # backport for older Python
+    except ImportError:
+        sys.stderr.write("hazsync: TOML parsing needs Python 3.11+ or the 'tomli' package.\n")
+        sys.stderr.write("       try: pip install tomli\n")
+        sys.exit(3)
+
+path = sys.argv[1]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    sys.stderr.write(f"hazsync: failed to parse {path}: {e}\n")
+    sys.exit(2)
+
+def need(section, key):
+    try:
+        return data[section][key]
+    except KeyError:
+        sys.stderr.write(f"hazsync: missing [{section}].{key} in {path}\n")
+        sys.exit(4)
+
+print(f"HAZEL_USER={shlex.quote(str(need('hazel', 'user')))}")
+print(f"HAZEL_HOST={shlex.quote(str(need('hazel', 'host')))}")
+print(f"HAZEL_BASE={shlex.quote(str(need('hazel', 'base')))}")
+print(f"HAZEL_TARGET_OVERRIDE={shlex.quote(str(data.get('hazel', {}).get('target', '')))}")
+print(f"LOCAL_BASE={shlex.quote(os.path.expanduser(str(need('local', 'base'))))}")
+
+excludes = data.get('sync', {}).get('excludes', [])
+sys.stdout.write("RSYNC_EXCLUDES=(")
+for e in excludes:
+    sys.stdout.write(f" {shlex.quote(str(e))}")
+sys.stdout.write(" )\n")
+PY
+)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        return $rc
+    fi
+    eval "$parsed"
+
+    if [[ -n "$HAZEL_TARGET_OVERRIDE" ]]; then
+        HAZEL_TARGET="$HAZEL_TARGET_OVERRIDE"
+    else
+        HAZEL_TARGET="$HAZEL_USER@$HAZEL_HOST"
+    fi
+}
+
+
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+# Build --exclude flags from the array above
+_build_excludes() {
+    local flags=()
+    for pattern in "${RSYNC_EXCLUDES[@]}"; do
+        flags+=(--exclude="$pattern")
+    done
+    echo "${flags[@]}"
+}
+
+# Parse a sub-command's options. Recognises --delete and --force.
+# Sets DELETE_FLAG to "--delete" if present (empty otherwise) and
+# FORCE_FLAG to "1" if --force was given (empty otherwise).
+# Any non-option arguments are collected into the PATHS array — these are
+# project-relative paths to sync individually (excludes bypassed).
+# Returns 1 on unknown option.
+_parse_flags() {
+    DELETE_FLAG=""
+    FORCE_FLAG=""
+    PATHS=()
+    for arg in "$@"; do
+        case "$arg" in
+            --delete) DELETE_FLAG="--delete" ;;
+            --force)  FORCE_FLAG="1" ;;
+            --*)
+                echo "hazsync: unknown option '$arg'" >&2
+                return 1
+                ;;
+            *)
+                # Reject absolute paths and parent escapes — these must be
+                # relative to the project root.
+                if [[ "$arg" == /* || "$arg" == ../* || "$arg" == *"/../"* ]]; then
+                    echo "hazsync: path must be relative to the project root: '$arg'" >&2
+                    return 1
+                fi
+                PATHS+=("${arg%/}")   # strip trailing slash for consistent -R behaviour
+                ;;
+        esac
+    done
+}
+
+# Interactively confirm a destructive --delete operation.
+# - $1 is a label for what gets pruned ("remote" or "local").
+# - Returns 0 to proceed, 1 to abort.
+# - --force skips the prompt.
+# - If stdin is not a TTY and --force was not given, refuse rather than
+#   silently proceeding (protects piped/scripted invocations).
+_confirm_delete() {
+    local direction="$1"
+    if [[ -n "$FORCE_FLAG" ]]; then
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        echo "hazsync: --delete is destructive and stdin is not a terminal." >&2
+        echo "       pass --force to skip the confirmation prompt." >&2
+        return 1
+    fi
+    local reply
+    read -r -p "Proceed and delete extraneous files on $direction? [y/N] " reply
+    case "$reply" in
+        y|Y|yes|YES) return 0 ;;
+        *)
+            echo "aborted."
+            return 1
+            ;;
+    esac
+}
+
+# Walk up from $PWD to find the nearest .projectroot marker
+# Stops at LOCAL_BASE so it never escapes the projects directory
+_find_project_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "$LOCAL_BASE" && "$dir" != "/" ]]; do
+        if [[ -f "$dir/.projectroot" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Is a multiplexed SSH master alive for HAZEL_TARGET?
+# Relies entirely on ~/.ssh/config to define ControlMaster/Path/Persist —
+# hazsync does NOT pass its own -o overrides. Silent (no stdout/stderr).
+_session_alive() {
+    ssh -O check "$HAZEL_TARGET" >/dev/null 2>&1
+}
+
+# Validate paths before any rsync command reaches the remote.
+# $1 = local project dir  $2 = full src string  $3 = full dst string
+# Aborts with a clear message on any failure — no rsync is run.
+_validate_paths() {
+    local local_path="$1" src="$2" dst="$3"
+
+    # LOCAL_BASE must exist
+    if [[ ! -d "$LOCAL_BASE" ]]; then
+        echo "hazsync: LOCAL_BASE does not exist: $LOCAL_BASE" >&2
+        echo "       check [local].base in your hazsync.toml" >&2
+        return 1
+    fi
+
+    # local_path must be non-empty, exist, and sit under LOCAL_BASE
+    if [[ -z "$local_path" ]]; then
+        echo "hazsync: could not resolve a local project path" >&2
+        return 1
+    fi
+    if [[ ! -d "$local_path" ]]; then
+        echo "hazsync: local path does not exist: $local_path" >&2
+        return 1
+    fi
+    local real_local real_base
+    real_local=$(cd "$local_path" && pwd -P)
+    real_base=$(cd "$LOCAL_BASE"  && pwd -P)
+    if [[ "$real_local" != "$real_base"/* && "$real_local" != "$real_base" ]]; then
+        echo "hazsync: local path escapes LOCAL_BASE — aborting" >&2
+        echo "       LOCAL_BASE : $real_base" >&2
+        echo "       local path : $real_local" >&2
+        return 1
+    fi
+
+    # HAZEL_BASE must be absolute (/...) or home-relative (~/...). The remote
+    # shell expands a leading ~, so both are valid rsync remote targets.
+    if [[ "$HAZEL_BASE" != /* && "$HAZEL_BASE" != "~/"* && "$HAZEL_BASE" != "~" ]]; then
+        echo "hazsync: [hazel].base must be an absolute (/...) or home-relative (~/...) path, got: $HAZEL_BASE" >&2
+        return 1
+    fi
+
+    # Print resolved paths so the user can eyeball them before anything runs
+    echo "  src : $src"
+    echo "  dst : $dst"
+    echo "  WARNING: the remote filesystem is NOT backed up — changes are final."
+    echo ""
+}
+
+# Used by push/pull/dry. If no multiplexed master is active, prompt the user
+# (default Y) to start one before kicking off rsync. Non-TTY runs proceed
+# without prompting so scripts and pipes don't hang.
+_ensure_session() {
+    if _session_alive; then
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+    local reply
+    read -r -p "No active Hazel session ($HAZEL_TARGET). Open one now? [Y/n] " reply
+    case "$reply" in
+        n|N|no|NO)
+            echo "  (proceeding without multiplexing; rsync will auth fresh.)"
+            return 0
+            ;;
+        *)
+            _session_start || return 1
+            ;;
+    esac
+}
+
+
+# =============================================================================
+# COMMANDS
+# =============================================================================
+
+cmd_init() {
+    if [[ -f "$PWD/.projectroot" ]]; then
+        echo "hazsync init: .projectroot already exists at $PWD"
+        return 0
+    fi
+    touch "$PWD/.projectroot"
+
+    if [[ ! -f "$PWD/.hazignore" ]]; then
+        cat > "$PWD/.hazignore" <<'EOF'
+# .hazignore — project-level rsync exclude patterns for hazsync
+# Syntax mirrors .gitignore: one pattern per line, # = comment, blank = ignored.
+# Patterns are matched relative to the project root.
+# See rsync(1) "INCLUDE/EXCLUDE PATTERN RULES" for advanced syntax.
+
+# --- build artefacts ---
+*.o
+*.mod
+*.a
+*.so
+*.exe
+*.out
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- editors / OS ---
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# --- data / large outputs (uncomment as needed) ---
+# results/
+# data/raw/
+# *.nc
+# *.h5
+# *.hdf5
+EOF
+        echo "  created $PWD/.hazignore  (edit to tune per-project excludes)"
+    else
+        echo "  .hazignore already exists — leaving it untouched"
+    fi
+
+    echo "hazsync init"
+    echo "  created $PWD/.projectroot"
+    echo "  project : $(basename "$PWD")"
+    echo "  remote  : $HAZEL_TARGET:$HAZEL_BASE/$(basename "$PWD")/"
+}
+
+cmd_push() {
+    _parse_flags "$@" || return 1
+
+    local root
+    root=$(_find_project_root)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: not inside a project (no .projectroot found)"
+        echo "       run: touch <project_root>/.projectroot"
+        return 1
+    fi
+
+    local repo
+    repo=$(basename "$root")
+
+    # Targeted push: send specific project-relative paths even if they are
+    # normally excluded. -R recreates each path under the remote project dir;
+    # no exclude rules are applied so ignored files/folders go through.
+    if [[ ${#PATHS[@]} -gt 0 ]]; then
+        local sources=()
+        local p
+        for p in "${PATHS[@]}"; do
+            sources+=("$root/./$p")
+        done
+        local rdst="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+        echo "hazsync push (targeted: ${PATHS[*]}; excludes bypassed)"
+        [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (extraneous files on remote will be removed)"
+        _validate_paths "$root" "${sources[*]}" "$rdst" || return 1
+        _ensure_session || return 1
+        if [[ -n "$DELETE_FLAG" ]]; then
+            _confirm_delete "remote ($rdst)" || return 1
+        fi
+        rsync -avR --progress $DELETE_FLAG "${sources[@]}" "$rdst"
+        return $?
+    fi
+
+    local src dst
+    src="$root/"
+    dst="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+
+    echo "hazsync push"
+    [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (extraneous files on remote will be removed)"
+    _validate_paths "$root" "$src" "$dst" || return 1
+    local hazignore_flag=()
+    [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
+    _ensure_session || return 1
+    if [[ -n "$DELETE_FLAG" ]]; then
+        _confirm_delete "remote ($dst)" || return 1
+    fi
+    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+}
+
+cmd_pull() {
+    _parse_flags "$@" || return 1
+
+    local root
+    root=$(_find_project_root)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: not inside a project (no .projectroot found)"
+        echo "       run: touch <project_root>/.projectroot"
+        return 1
+    fi
+
+    local repo
+    repo=$(basename "$root")
+
+    # Targeted pull: fetch specific project-relative paths even if they are
+    # normally excluded. -R recreates each path under the project root; no
+    # exclude rules are applied so ignored files/folders come through.
+    if [[ ${#PATHS[@]} -gt 0 ]]; then
+        local sources=()
+        local p
+        for p in "${PATHS[@]}"; do
+            sources+=("$HAZEL_TARGET:$HAZEL_BASE/$repo/./$p")
+        done
+        echo "hazsync pull (targeted: ${PATHS[*]}; excludes bypassed)"
+        [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (extraneous files on local will be removed)"
+        _validate_paths "$root" "${sources[*]}" "$root/" || return 1
+        _ensure_session || return 1
+        if [[ -n "$DELETE_FLAG" ]]; then
+            _confirm_delete "local ($root/)" || return 1
+        fi
+        rsync -avR --progress $DELETE_FLAG "${sources[@]}" "$root/"
+        return $?
+    fi
+
+    local src dst
+    src="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+    dst="$root/"
+
+    echo "hazsync pull"
+    [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (extraneous files on local will be removed)"
+    _validate_paths "$root" "$src" "$dst" || return 1
+    local hazignore_flag=()
+    [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
+    _ensure_session || return 1
+    if [[ -n "$DELETE_FLAG" ]]; then
+        _confirm_delete "local ($dst)" || return 1
+    fi
+    rsync -av --progress $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+}
+
+cmd_dry_push() {
+    _parse_flags "$@" || return 1
+
+    local root
+    root=$(_find_project_root)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: not inside a project (no .projectroot found)"
+        echo "       run: touch <project_root>/.projectroot"
+        return 1
+    fi
+
+    local repo
+    repo=$(basename "$root")
+
+    if [[ ${#PATHS[@]} -gt 0 ]]; then
+        local sources=()
+        local p
+        for p in "${PATHS[@]}"; do
+            sources+=("$root/./$p")
+        done
+        local rdst="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+        echo "hazsync dry-push (no files will be transferred; targeted: ${PATHS[*]}; excludes bypassed)"
+        [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (previews what push --delete would remove on remote)"
+        _validate_paths "$root" "${sources[*]}" "$rdst" || return 1
+        _ensure_session || return 1
+        rsync -anvR $DELETE_FLAG "${sources[@]}" "$rdst"
+        return $?
+    fi
+
+    local src dst
+    src="$root/"
+    dst="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+
+    echo "hazsync dry-push (no files will be transferred)"
+    [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (previews what push --delete would remove on remote)"
+    _validate_paths "$root" "$src" "$dst" || return 1
+    local hazignore_flag=()
+    [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
+    _ensure_session || return 1
+    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+}
+
+cmd_dry_pull() {
+    _parse_flags "$@" || return 1
+
+    local root
+    root=$(_find_project_root)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: not inside a project (no .projectroot found)"
+        echo "       run: touch <project_root>/.projectroot"
+        return 1
+    fi
+
+    local repo
+    repo=$(basename "$root")
+
+    if [[ ${#PATHS[@]} -gt 0 ]]; then
+        local sources=()
+        local p
+        for p in "${PATHS[@]}"; do
+            sources+=("$HAZEL_TARGET:$HAZEL_BASE/$repo/./$p")
+        done
+        echo "hazsync dry-pull (no files will be transferred; targeted: ${PATHS[*]}; excludes bypassed)"
+        [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (previews what pull --delete would remove locally)"
+        _validate_paths "$root" "${sources[*]}" "$root/" || return 1
+        _ensure_session || return 1
+        rsync -anvR $DELETE_FLAG "${sources[@]}" "$root/"
+        return $?
+    fi
+
+    local src dst
+    src="$HAZEL_TARGET:$HAZEL_BASE/$repo/"
+    dst="$root/"
+
+    echo "hazsync dry-pull (no files will be transferred)"
+    [[ -n "$DELETE_FLAG" ]] && echo "  mode   : --delete (previews what pull --delete would remove locally)"
+    _validate_paths "$root" "$src" "$dst" || return 1
+    local hazignore_flag=()
+    [[ -f "$root/.hazignore" ]] && hazignore_flag=(--exclude-from="$root/.hazignore")
+    _ensure_session || return 1
+    rsync -anv $DELETE_FLAG "${hazignore_flag[@]}" $(_build_excludes) "$src" "$dst"
+}
+
+cmd_status() {
+    local root
+    root=$(_find_project_root)
+    if [[ $? -ne 0 ]]; then
+        echo "hazsync status: not inside a project (no .projectroot found)"
+        return 1
+    fi
+
+    local repo
+    repo=$(basename "$root")
+
+    echo "hazsync status"
+    echo "  project : $repo"
+    echo "  local   : $root/"
+    echo "  remote  : $HAZEL_TARGET:$HAZEL_BASE/$repo/"
+}
+
+_session_start() {
+    if _session_alive; then
+        echo "hazsync session: master already running for $HAZEL_TARGET"
+        return 0
+    fi
+    echo "hazsync session start"
+    echo "  target : $HAZEL_TARGET"
+    echo "  (you may be prompted for password/Duo now; this happens once per session.)"
+    # -M ControlMaster, -N no remote command, -f background after auth.
+    # Relies on ControlPath / ControlPersist in ~/.ssh/config for $HAZEL_TARGET.
+    if ssh -MNf "$HAZEL_TARGET"; then
+        echo "  master is up; subsequent hazsync calls reuse it."
+    else
+        echo "hazsync session start: failed to open master." >&2
+        echo "       check that ~/.ssh/config has ControlMaster, ControlPath," >&2
+        echo "       and ControlPersist set for $HAZEL_TARGET." >&2
+        return 1
+    fi
+}
+
+_session_status() {
+    echo "hazsync session status"
+    echo "  target : $HAZEL_TARGET"
+    if _session_alive; then
+        echo "  state  : alive (multiplexed master detected)"
+        return 0
+    else
+        echo "  state  : not running"
+        return 1
+    fi
+}
+
+_session_end() {
+    if ! _session_alive; then
+        echo "hazsync session end: no master running for $HAZEL_TARGET"
+        return 0
+    fi
+    if ssh -O exit "$HAZEL_TARGET" 2>&1; then
+        echo "hazsync session end: master closed for $HAZEL_TARGET"
+    fi
+}
+
+# Open a fresh interactive shell on Hazel. Goes direct — ssh will transparently
+# reuse the multiplexed master if one is up, or auth fresh if not.
+_session_new() {
+    echo "hazsync session new → ssh $HAZEL_TARGET"
+    exec ssh -t "$HAZEL_TARGET"
+}
+
+cmd_session() {
+    local sub="$1"
+    shift 2>/dev/null
+    case "$sub" in
+        start)  _session_start  "$@" ;;
+        status) _session_status "$@" ;;
+        end)    _session_end    "$@" ;;
+        new)    _session_new    "$@" ;;
+        ""|help)
+            echo "Usage: hazsync session <start|status|end|new>"
+            echo ""
+            echo "  start   open a persistent SSH master to Hazel (one auth, then warm)"
+            echo "  status  show whether the master socket is alive"
+            echo "  end     close the master socket"
+            echo "  new     open a new interactive shell on Hazel (reuses master if up)"
+            echo ""
+            echo "Multiplexing is configured in ~/.ssh/config — hazsync just leverages it."
+            echo "Required directives on the $HAZEL_TARGET host:"
+            echo "  ControlMaster auto"
+            echo "  ControlPath ~/.ssh/cm-%r@%h:%p"
+            echo "  ControlPersist 4h"
+            ;;
+        *)
+            echo "hazsync session: unknown subcommand '$sub'" >&2
+            echo "       run: hazsync session help" >&2
+            return 1
+            ;;
+    esac
+}
+
+cmd_config_init() {
+    local target="${HAZSYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hazsync/hazsync.toml}"
+
+    if [[ -f "$target" ]]; then
+        echo "hazsync config-init: $target already exists; not overwriting."
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    cat > "$target" <<'EOF'
+# hazsync configuration
+# See `hazsync help` for the lookup order.
+
+[hazel]
+user = "your_unity_id"
+host = "login.hpc.ncsu.edu"
+base = "/home/your_unity_id"
+# Optional: SSH alias from ~/.ssh/config to use instead of user@host.
+# target = "hazel"
+
+[local]
+base = "~/projects"
+
+[sync]
+excludes = [
+    ".DS_Store",
+    ".projectroot",
+    "*.o",        # compiled object files
+    "*.mod",      # Fortran module files
+    "*.exe",      # compiled executables
+    "*.out",      # job output files
+    "__pycache__",
+]
+EOF
+    echo "hazsync config-init"
+    echo "  wrote default config: $target"
+    echo "  edit it to set [hazel].user/host/base, then 'hazsync init' in a project."
+}
+
+cmd_help() {
+    echo "hazsync — rsync sync tool for Hazel HPC"
+    echo ""
+    echo "Usage: hazsync <command>"
+    echo ""
+    echo "Commands:"
+    echo "  init                       create a .projectroot marker in the current directory"
+    echo "  push [--delete] [--force] [PATH...]  sync local project → Hazel"
+    echo "  pull [--delete] [--force] [PATH...]  sync Hazel project → local"
+    echo "  dry-push [--delete]        preview what push would transfer to Hazel
+  dry-pull [--delete]        preview what pull would bring from Hazel"
+    echo "  status                     show project name and sync targets (no network call)"
+    echo "  session <sub>              manage the multiplexed Hazel SSH session"
+    echo "                               start   open a persistent master (one auth, then warm)"
+    echo "                               status  is the master alive?"
+    echo "                               end     close the master"
+    echo "                               new     open a new interactive shell on Hazel"
+    echo "  config-init                write a default hazsync.toml if none exists"
+    echo "  help                       show this message"
+    echo ""
+    echo "Flags:"
+    echo "  --delete  also remove files on the destination that no longer exist"
+    echo "            on the source. Destructive — preview first with:"
+    echo "            hazsync dry-push --delete  or  hazsync dry-pull --delete"
+    echo "  --force   skip the interactive [y/N] confirmation that --delete triggers."
+    echo "            Required when stdin is not a terminal (scripts, pipes)."
+    echo ""
+    echo "Targeted sync:"
+    echo "  Pass one or more project-relative PATHs to push/pull to sync only"
+    echo "  those files/folders. Exclude rules (.hazignore + config) are bypassed,"
+    echo "  so this is how you grab something that is normally ignored:"
+    echo "    hazsync pull results/run42.nc      fetch one ignored output file"
+    echo "    hazsync push data/raw/             send one ignored folder"
+    echo ""
+    echo "Config (TOML), looked up in this order:"
+    echo "  \$HAZSYNC_CONFIG"
+    echo "  \${XDG_CONFIG_HOME:-\$HOME/.config}/hazsync/hazsync.toml"
+    echo "  ~/.hazsync.toml"
+    echo ""
+    echo "Run from anywhere inside a project directory."
+    echo "Mark project roots with: hazsync init  (or: touch <project_root>/.projectroot)"
+}
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+subcmd="$1"
+shift 2>/dev/null
+case "$subcmd" in
+    # config-init, help and version don't need (and shouldn't require) a config file.
+    config-init)            cmd_config_init "$@" ;;
+    help|--help|-h)         cmd_help             ;;
+    version|--version|-V)   echo "hazsync $HAZSYNC_VERSION" ;;
+
+    # All other commands consult the loaded config.
+    init|push|pull|dry-push|dry-pull|status|session)
+        _load_config || exit 1
+        case "$subcmd" in
+            init)     cmd_init     "$@" ;;
+            push)     cmd_push     "$@" ;;
+            pull)     cmd_pull     "$@" ;;
+            dry-push) cmd_dry_push "$@" ;;
+            dry-pull) cmd_dry_pull "$@" ;;
+            status)   cmd_status   "$@" ;;
+            session)  cmd_session  "$@" ;;
+        esac
+        ;;
+
+    *)
+        echo "hazsync: unknown command '$subcmd'"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac
